@@ -3066,6 +3066,7 @@ export default function Core(rootContainer, userSettings, rootInstanceSymbol = f
     }
 
     let height = settings.height;
+    let processedWidth;
 
     if (typeof settings.height !== 'undefined') {
       if (isFunction(height)) {
@@ -3092,32 +3093,54 @@ export default function Core(rootContainer, userSettings, rootInstanceSymbol = f
     }
 
     if (typeof settings.width !== 'undefined') {
-      let width = settings.width;
+      processedWidth = settings.width;
 
-      if (isFunction(width)) {
-        width = width();
+      if (isFunction(processedWidth)) {
+        processedWidth = processedWidth();
       }
 
-      width = instance.runHooks('beforeWidthChange', width);
-      instance.rootElement.style.width = isNaN(width) ? `${width}` : `${width}px`;
+      processedWidth = instance.runHooks('beforeWidthChange', processedWidth);
+      instance.rootElement.style.width = isNaN(processedWidth) ? `${processedWidth}` : `${processedWidth}px`;
+    }
 
-      // When `height` is not set, the table uses window vertical scroll. In that mode, not setting any overflow
-      // on the root element can allow the inner table to visually overflow the configured width.
-      // Setting only the horizontal overflow to `clip` keeps window scrolling intact while ensuring `width`
-      // constrains the grid. `overflow-x: hidden` was considered but rejected because it creates a block
-      // formatting context (BFC), which would interfere with the window-scroll model.
-      // Treat “no effective height” like omitting height: missing key, `null`, or `undefined` after resolution.
-      // Use the processed `height` value (after function resolution and `beforeHeightChange`), not `settings.height`,
-      // so hooks that coerce height to `null` still get horizontal clipping when `width` is set.
-      // Skip clipping for `width: 'auto'` — auto width fills the container naturally and has no
-      // constrained boundary to overflow, so horizontal clipping is unnecessary and causes layout issues.
-      // Browser compatibility note:
-      // - Safari < 16: `overflow-x: clip` is not supported and silently falls back to `visible`. The
-      //   horizontal-overflow fix has no effect on Safari 14.1–15.x (graceful degradation — no regression).
-      // - Safari (all versions): a browser bug causes `overflow-x: clip` to clip both axes. With a
-      //   content-driven height the clip boundary grows with the content, so the practical impact is limited.
-      if ((height === undefined || height === null) && width !== 'auto') {
+    // Sync overflowX: 'clip' whenever height or width may have changed.
+    // Runs after both blocks so:
+    //   - partial width-only calls respect any existing height (Thread 1);
+    //   - height-only resets also update the clip state when width is configured (Thread 1);
+    //   - stale clip from a previous state is cleared when conditions change (Thread 2).
+    //
+    // When `height` is not set the table uses window vertical scroll. In that mode, setting only
+    // the horizontal overflow to `clip` keeps window scrolling intact while ensuring `width`
+    // constrains the grid. `overflow-x: hidden` was rejected because it creates a block formatting
+    // context (BFC) that breaks the window-scroll model.
+    //
+    // effectiveHeight: use the processed value (function-resolved + hook-applied) when height was
+    // part of this call; otherwise read the current merged setting so partial width-only calls
+    // correctly detect that a height is already configured.
+    //
+    // effectiveWidth: use the processed value when width was part of this call; otherwise read the
+    // current merged setting so height-only calls can check whether a width is configured.
+    //
+    // Skip clipping for `width: 'auto'` — auto-width fills the container naturally and has no
+    // constrained boundary to clip, so applying clip is unnecessary and causes layout issues.
+    // Browser compatibility note:
+    // - Safari < 16: `overflow-x: clip` is not supported and silently falls back to `visible`. The
+    //   horizontal-overflow fix has no effect on Safari 14.1–15.x (graceful degradation — no regression).
+    // - Safari (all versions): a browser bug causes `overflow-x: clip` to clip both axes. With a
+    //   content-driven height the clip boundary grows with the content, so the practical impact is limited.
+    if (typeof settings.width !== 'undefined' || typeof settings.height !== 'undefined') {
+      const effectiveHeight = typeof settings.height !== 'undefined'
+        ? height
+        : instance.getSettings().height;
+      const effectiveWidth = typeof settings.width !== 'undefined'
+        ? processedWidth
+        : instance.getSettings().width;
+
+      if (effectiveWidth !== undefined && effectiveWidth !== null && effectiveWidth !== 'auto' &&
+          (effectiveHeight === undefined || effectiveHeight === null)) {
         instance.rootElement.style.overflowX = 'clip';
+      } else {
+        instance.rootElement.style.overflowX = '';
       }
     }
 
