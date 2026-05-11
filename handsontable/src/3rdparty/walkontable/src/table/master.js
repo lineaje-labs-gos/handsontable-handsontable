@@ -45,9 +45,14 @@ class MasterTable extends Table {
       let width = trimmingElement.offsetWidth;
       let height = trimmingElement.offsetHeight;
       const overflowValues = ['auto', 'hidden', 'scroll', 'clip'];
-      // getStyle() may return a compound value (e.g. 'auto hidden') when overflow-x and
-      // overflow-y are set independently. Split on whitespace so each token is checked.
-      const hasScrollOverflow = trimmingOverflow.split(' ').some(v => overflowValues.includes(v));
+      // Chrome resolves the overflow shorthand from individual properties natively
+      // (e.g. overflowX='clip' → computed overflow='clip visible'). Only fall back to
+      // reading overflowX/overflowY individually when the shorthand is absent — that
+      // covers jsdom, where setting overflowX inline does not update the overflow shorthand.
+      const hasScrollOverflow = trimmingOverflow !== undefined
+        ? trimmingOverflow.split(' ').some(v => overflowValues.includes(v))
+        : [getStyle(trimmingElement, 'overflowX', rootWindow), getStyle(trimmingElement, 'overflowY', rootWindow)]
+          .some(v => v && overflowValues.includes(v));
       let useAutoHeight = (trimmingHeight === 'auto');
 
       if (trimmingElementParent && hasScrollOverflow) {
