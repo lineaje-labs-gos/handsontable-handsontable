@@ -143,6 +143,12 @@
   border-inline-start-color: #41a167 !important;
 }
 
+/* Expressive Code del (deleted) line highlight — light theme only; matches ins subtlety */
+:root[data-theme='light'] .expressive-code .ec-line.del {
+  background-color: rgba(134, 45, 39, 0.15) !important;
+  border-inline-start-color: #862d27 !important;
+}
+
 /* -------------------------------------------------------------------------
  * FileTree — unscoped replica of Starlight's FileTree.astro CSS.
  * The built-in component CSS is scoped with :where(.astro-*) and won't
