@@ -68,6 +68,9 @@
   --ec-frm-shdCol: transparent;
   --ec-frm-frameBoxShdCssVal: none;
   --ec-frm-trmTtbBrdBtmCol: var(--sl-color-gray-5);
+  /* Line / inline "mark" highlights: same RGB as .expressive-code defaults, lower alpha for light */
+  --ec-tm-markBg: #174a9028;
+  --ec-tm-markBrdCol: #4d70bc55;
 }
 
 :root[data-theme='light'] .expressive-code .copy button {
