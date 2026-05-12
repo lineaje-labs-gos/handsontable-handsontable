@@ -5,7 +5,7 @@
   "homepage": "https://handsontable.com/",
   "repository": {
     "type": "git",
-    "url": "https://github.com/handsontable/handsontable.git"
+    "url": "https://github.com/lineaje-labs-gos/handsontable-handsontable"
   },
   "bugs": {
     "url": "https://github.com/handsontable/handsontable/issues"
@@ -70,6 +70,12 @@
     "yargs": "^16.2.0"
   },
   "license": "SEE LICENSE IN LICENSE.txt",
+  "contributors": [
+    {
+      "name": "Lineaje DepFixer",
+      "email": "221268890+Lineaje-DepFixer@users.noreply.github.com"
+    }
+  ],
   "resolutions": {
     "babel-core": "7.0.0-bridge.0"
   },
@@ -77,5 +83,6 @@
     "handsontable",
     "wrappers/*",
     "examples"
-  ]
+  ],
+  "version": "11.1.0-lineaje-01"
 }
