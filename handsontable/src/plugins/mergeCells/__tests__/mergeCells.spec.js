@@ -2305,5 +2305,108 @@ describe('MergeCells', () => {
 
       expect(countRows()).toBe(2);
     });
+
+    it('should keep a merge created while a filter is active after the filter is cleared', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 0, col: 0, rowspan: 2, colspan: 2 } // A1:B2 (pre-existing, unrelated)
+        ],
+      });
+      const filters = getPlugin('filters');
+      const mergeCells = getPlugin('mergeCells');
+
+      // keep physical rows 0, 1, 4, 5 -> visual rows 0, 1, 2, 3
+      filters.addCondition(4, 'by_value', [['E1', 'E2', 'E5', 'E6']]);
+      filters.filter();
+
+      await render();
+
+      // user merges C5:D6 (physical rows 4, 5) -> visual rows 2, 3
+      mergeCells.merge(2, 2, 3, 3);
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      const TD = getCell(4, 2);
+
+      expect(TD.getAttribute('rowspan')).toBe('2');
+      expect(TD.getAttribute('colspan')).toBe('2');
+    });
+
+    it('should not resurrect a merge unmerged while a filter is active after the filter is cleared', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 0, col: 0, rowspan: 2, colspan: 2 }, // A1:B2
+          { row: 4, col: 2, rowspan: 2, colspan: 2 } // C5:D6
+        ],
+      });
+      const filters = getPlugin('filters');
+      const mergeCells = getPlugin('mergeCells');
+
+      // keep physical rows 0, 1, 4, 5 -> visual rows 0, 1, 2, 3 (both merges visible)
+      filters.addCondition(4, 'by_value', [['E1', 'E2', 'E5', 'E6']]);
+      filters.filter();
+
+      await render();
+
+      // user unmerges C5:D6 -> now at visual rows 2, 3
+      mergeCells.unmerge(2, 2, 3, 3);
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      // the unmerged cell must stay unmerged...
+      expect(getCell(4, 2).getAttribute('rowspan')).toBe(null);
+      expect(getCell(4, 2).getAttribute('colspan')).toBe(null);
+      // ...while the untouched merge is restored.
+      expect(getCell(0, 0).getAttribute('rowspan')).toBe('2');
+      expect(getCell(0, 0).getAttribute('colspan')).toBe('2');
+    });
+
+    it('should not reuse a stale filter snapshot after the plugin is disabled and re-enabled', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 0, col: 0, rowspan: 2, colspan: 2 } // A1:B2
+        ],
+      });
+      const filters = getPlugin('filters');
+
+      // capture a snapshot tied to the A1:B2 layout while a filter is active
+      filters.addCondition(4, 'by_value', [['E1', 'E2', 'E5', 'E6']]);
+      filters.filter();
+
+      await render();
+
+      // disable the plugin while the snapshot is still set (this must drop it)...
+      await updateSettings({ mergeCells: false });
+
+      // ...then go back to an unfiltered view and re-enable with a different layout.
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      await updateSettings({ mergeCells: [{ row: 4, col: 2, rowspan: 2, colspan: 2 }] }); // C5:D6
+
+      // filtering again must capture the NEW layout, not the stale A1:B2 one
+      filters.addCondition(4, 'by_value', [['E5', 'E6']]);
+      filters.filter();
+
+      await render();
+
+      // C5:D6 -> physical rows 4, 5 (the only visible ones) -> visual rows 0, 1
+      expect(getCell(0, 2).getAttribute('rowspan')).toBe('2');
+      expect(getCell(0, 2).getAttribute('colspan')).toBe('2');
+    });
   });
 });

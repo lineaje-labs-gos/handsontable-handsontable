@@ -2,7 +2,7 @@
   "issuesOrigin": "public",
   "title": "Fixed merged cells disappearing after filtering — merges are now clipped to the visible rows and restored once the filter is cleared, without data loss.",
   "type": "fixed",
-  "issueOrPR": 12781,
+  "issueOrPR": 12792,
   "breaking": false,
   "framework": "none"
 }

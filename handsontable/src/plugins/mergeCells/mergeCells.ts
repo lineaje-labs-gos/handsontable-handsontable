@@ -245,6 +245,8 @@ export class MergeCells extends BasePlugin {
     this.addHook('afterRowMove', this.#onAfterRowMove);
     this.addHook('beforeFilter', this.#onBeforeFilter);
     this.addHook('afterFilter', this.#onAfterFilter);
+    this.addHook('afterMergeCells', this.#onAfterMergeCells);
+    this.addHook('afterUnmergeCells', this.#onAfterUnmergeCells);
     this.addHook('beforeColumnFreeze', this.#onBeforeColumnFreeze);
     this.addHook('afterColumnFreeze', this.#onAfterColumnFreeze);
     this.addHook('beforeColumnUnfreeze', this.#onBeforeColumnFreeze);
@@ -274,6 +276,9 @@ export class MergeCells extends BasePlugin {
     this.unregisterShortcuts();
     this.hot.render();
     this.#initialized = false;
+    // Drop any pending filter snapshot, so toggling the plugin (or `updatePlugin`) does not
+    // skip a fresh capture and rebuild merges from an outdated layout.
+    this.#filterPhysicalSnapshot = null;
     super.disablePlugin();
   }
 
@@ -1606,6 +1611,91 @@ export class MergeCells extends BasePlugin {
   };
 
   /**
+   * `afterMergeCells` hook callback. While a filter is active, keeps the captured snapshot in
+   * sync with merges created by the user/API, so they are not discarded on the next `filter()`
+   * call and survive clearing the filter. Plugin-internal (`auto`) merges are ignored — those
+   * are produced by `#rebuildMergesFromPhysical` and `generateFromSettings` themselves.
+   *
+   * @param {CellRange} _cellRange The merged range (unused).
+   * @param {{ row: number, col: number, rowspan: number, colspan: number }} mergeParent The merged cell.
+   * @param {boolean} [auto] `true` when triggered internally by the plugin.
+   */
+  #onAfterMergeCells = (
+    _cellRange: CellRange,
+    mergeParent: { row: number, col: number, rowspan: number, colspan: number },
+    auto?: boolean
+  ) => {
+    if (auto || this.#filterPhysicalSnapshot === null) {
+      return;
+    }
+
+    const rows = [];
+    const cols = [];
+
+    for (let r = mergeParent.row; r < mergeParent.row + mergeParent.rowspan; r++) {
+      const physicalRow = this.hot.toPhysicalRow(r);
+
+      if (physicalRow !== null) {
+        rows.push(physicalRow);
+      }
+    }
+    for (let c = mergeParent.col; c < mergeParent.col + mergeParent.colspan; c++) {
+      const physicalColumn = this.hot.toPhysicalColumn(c);
+
+      if (physicalColumn !== null) {
+        cols.push(physicalColumn);
+      }
+    }
+
+    if (rows.length > 0 && cols.length > 0) {
+      this.#filterPhysicalSnapshot.push({ rows, cols });
+    }
+  };
+
+  /**
+   * `afterUnmergeCells` hook callback. While a filter is active, drops the snapshot entries that
+   * overlap the unmerged range, so user/API unmerges are not resurrected on the next `filter()`
+   * call or when the filter is cleared. Plugin-internal (`auto`) unmerges are ignored.
+   *
+   * @param {CellRange} cellRange The unmerged range.
+   * @param {boolean} [auto] `true` when triggered internally by the plugin.
+   */
+  #onAfterUnmergeCells = (cellRange: CellRange, auto?: boolean) => {
+    if (auto || this.#filterPhysicalSnapshot === null) {
+      return;
+    }
+
+    const topStart = cellRange.getTopStartCorner();
+    const bottomEnd = cellRange.getBottomEndCorner();
+
+    if (topStart.row === null || topStart.col === null || bottomEnd.row === null || bottomEnd.col === null) {
+      return;
+    }
+
+    const physicalRows = new Set<number>();
+    const physicalColumns = new Set<number>();
+
+    for (let r = topStart.row; r <= bottomEnd.row; r++) {
+      const physicalRow = this.hot.toPhysicalRow(r);
+
+      if (physicalRow !== null) {
+        physicalRows.add(physicalRow);
+      }
+    }
+    for (let c = topStart.col; c <= bottomEnd.col; c++) {
+      const physicalColumn = this.hot.toPhysicalColumn(c);
+
+      if (physicalColumn !== null) {
+        physicalColumns.add(physicalColumn);
+      }
+    }
+
+    this.#filterPhysicalSnapshot = this.#filterPhysicalSnapshot.filter(entry =>
+      !(entry.rows.some(row => physicalRows.has(row)) && entry.cols.some(col => physicalColumns.has(col)))
+    );
+  };
+
+  /**
    * Captures every merged cell as the list of physical row and column indexes it covers.
    * Physical indexes are stable across trimming, so they survive filter changes.
    *
@@ -1617,10 +1707,18 @@ export class MergeCells extends BasePlugin {
       const cols = [];
 
       for (let r = mergedCell.row; r < mergedCell.row + mergedCell.rowspan; r++) {
-        rows.push(this.hot.toPhysicalRow(r));
+        const physicalRow = this.hot.toPhysicalRow(r);
+
+        if (physicalRow !== null) {
+          rows.push(physicalRow);
+        }
       }
       for (let c = mergedCell.col; c < mergedCell.col + mergedCell.colspan; c++) {
-        cols.push(this.hot.toPhysicalColumn(c));
+        const physicalColumn = this.hot.toPhysicalColumn(c);
+
+        if (physicalColumn !== null) {
+          cols.push(physicalColumn);
+        }
       }
 
       return { rows, cols };
