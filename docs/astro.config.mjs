@@ -706,7 +706,27 @@ export default defineConfig({
           content: '/* HOT base styles loaded via handsontable-import.css */',
         },
         // ── All-environment 3rd-party scripts ──────────────────────────────
-        // Sentry error monitoring
+        // Sentry error monitoring — configure beforeSend *before* the loader runs so
+        // that the callback is available when the Sentry Loader Script reads
+        // window.sentryOnLoad during initialization.  Errors thrown by
+        // Handsontable's own throwWithCause() helper carry
+        // `error.cause.handsontable === true`; those are intentional developer
+        // feedback errors (e.g. ColumnSummary data-type errors in demo examples)
+        // and should not be forwarded to Sentry.
+        {
+          tag: 'script',
+          content: `window.sentryOnLoad = function() {
+  Sentry.init({
+    beforeSend: function(event, hint) {
+      var error = hint && hint.originalException;
+      if (error && error.cause && error.cause.handsontable === true) {
+        return null;
+      }
+      return event;
+    }
+  });
+};`,
+        },
         {
           tag: 'script',
           attrs: {
