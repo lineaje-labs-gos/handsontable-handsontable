@@ -14,7 +14,7 @@ import { GridSettings, HotTableModule} from '@handsontable/angular-wrapper';
 })
 export class AppComponent {
 
-  readonly hotData = [[0, 1, 2], ['3c', '4b', 5], [], []];
+  readonly hotData = [[0, 1, 2], [3, 4, 5], [], []];
 
   readonly hotSettings: GridSettings = {
     colHeaders: true,
