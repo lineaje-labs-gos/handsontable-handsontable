@@ -173,6 +173,16 @@ export class MergeCells extends BasePlugin {
    */
   #rowMoveSnapshot: Map<MergedCellCoords, number[]> | null = null;
   /**
+   * Snapshot of the full merge set (in physical row/column indexes) captured the first time
+   * a filter is applied from a clean state. Filtering trims rows, which reshuffles visual
+   * indexes; this snapshot lets us rebuild merges clipped to the visible rows and restore
+   * the original merges once all filter conditions are cleared. `null` whenever no filter
+   * is active, so a grid without merges (or without filtering) pays nothing.
+   *
+   * @type {Array<{ rows: number[], cols: number[] }> | null}
+   */
+  #filterPhysicalSnapshot: { rows: number[], cols: number[] }[] | null = null;
+  /**
    * `true` once the plugin has finished its initial settings ingestion. Used to skip
    * snapshot/translate during the bootstrap-time column reorders fired by
    * `manualColumnMove: [...]` initial config, where the merge collection is empty
@@ -233,6 +243,8 @@ export class MergeCells extends BasePlugin {
     this.addHook('afterColumnMove', this.#onAfterColumnMove);
     this.addHook('beforeRowMove', this.#onBeforeRowMove);
     this.addHook('afterRowMove', this.#onAfterRowMove);
+    this.addHook('beforeFilter', this.#onBeforeFilter);
+    this.addHook('afterFilter', this.#onAfterFilter);
     this.addHook('beforeColumnFreeze', this.#onBeforeColumnFreeze);
     this.addHook('afterColumnFreeze', this.#onAfterColumnFreeze);
     this.addHook('beforeColumnUnfreeze', this.#onBeforeColumnFreeze);
@@ -1558,6 +1570,133 @@ export class MergeCells extends BasePlugin {
     this.mergedCellsCollection.translateAfterAxisMove('row', snapshot);
     this.hot.render();
   };
+
+  /**
+   * `beforeFilter` hook callback. Captures the full merge set (in physical coordinates) the
+   * first time a filter runs from a clean (unfiltered) state, so the merges can later be
+   * rebuilt against whatever rows remain visible. No-op when there are no merged cells.
+   */
+  #onBeforeFilter = () => {
+    if (this.#filterPhysicalSnapshot !== null || this.mergedCellsCollection.mergedCells.length === 0) {
+      return;
+    }
+
+    this.#filterPhysicalSnapshot = this.#captureMergesAsPhysical();
+  };
+
+  /**
+   * `afterFilter` hook callback. Rebuilds the merged cells so each one spans only the rows
+   * that survived filtering (splitting where the visible rows are no longer contiguous).
+   * When all conditions are cleared, the original merges are restored and the snapshot dropped.
+   *
+   * @param {Array} conditionsStack The exported stack of filter conditions (empty when cleared).
+   */
+  #onAfterFilter = (conditionsStack: unknown[]) => {
+    const snapshot = this.#filterPhysicalSnapshot;
+
+    if (snapshot === null) {
+      return;
+    }
+
+    this.#rebuildMergesFromPhysical(snapshot);
+
+    if (!Array.isArray(conditionsStack) || conditionsStack.length === 0) {
+      this.#filterPhysicalSnapshot = null;
+    }
+  };
+
+  /**
+   * Captures every merged cell as the list of physical row and column indexes it covers.
+   * Physical indexes are stable across trimming, so they survive filter changes.
+   *
+   * @returns {Array<{ rows: number[], cols: number[] }>}
+   */
+  #captureMergesAsPhysical(): { rows: number[], cols: number[] }[] {
+    return this.mergedCellsCollection.mergedCells.map((mergedCell) => {
+      const rows = [];
+      const cols = [];
+
+      for (let r = mergedCell.row; r < mergedCell.row + mergedCell.rowspan; r++) {
+        rows.push(this.hot.toPhysicalRow(r));
+      }
+      for (let c = mergedCell.col; c < mergedCell.col + mergedCell.colspan; c++) {
+        cols.push(this.hot.toPhysicalColumn(c));
+      }
+
+      return { rows, cols };
+    });
+  }
+
+  /**
+   * Rebuilds the merged cells collection from a physical snapshot, clipping each merge to the
+   * rows/columns currently visible and splitting it where the visible indexes are no longer
+   * contiguous. Single-cell fragments are dropped. Underlying data is preserved (the merges
+   * are re-created with `preventPopulation`).
+   *
+   * @param {Array<{ rows: number[], cols: number[] }>} snapshot Physical snapshot of merges.
+   */
+  #rebuildMergesFromPhysical(snapshot: { rows: number[], cols: number[] }[]) {
+    const { rowIndexMapper: rowMapper, columnIndexMapper: columnMapper } = this.hot;
+
+    this.clearCollections();
+
+    // Reset leftover `hidden`/`spanned` cell meta within the original merge areas, so cells
+    // no longer covered by a (clipped) merge render normally.
+    snapshot.forEach(({ rows, cols }) => {
+      rows.forEach((physicalRow) => {
+        const visualRow = rowMapper.getVisualFromPhysicalIndex(physicalRow);
+
+        if (visualRow === null) {
+          return;
+        }
+
+        cols.forEach((physicalColumn) => {
+          const visualColumn = columnMapper.getVisualFromPhysicalIndex(physicalColumn);
+
+          if (visualColumn === null) {
+            return;
+          }
+
+          this.hot.removeCellMeta(visualRow, visualColumn, 'hidden');
+          this.hot.removeCellMeta(visualRow, visualColumn, 'spanned');
+        });
+      });
+    });
+
+    snapshot.forEach(({ rows, cols }) => {
+      const visualRows = rows
+        .map(physicalRow => rowMapper.getVisualFromPhysicalIndex(physicalRow))
+        .filter((visualRow): visualRow is number => visualRow !== null && visualRow >= 0)
+        .sort((a, b) => a - b);
+      const visualColumns = cols
+        .map(physicalColumn => columnMapper.getVisualFromPhysicalIndex(physicalColumn))
+        .filter((visualColumn): visualColumn is number => visualColumn !== null && visualColumn >= 0)
+        .sort((a, b) => a - b);
+
+      if (visualRows.length === 0 || visualColumns.length === 0) {
+        return;
+      }
+
+      MergedCellsCollection.detectContiguousRuns(visualRows).forEach((rowRun) => {
+        MergedCellsCollection.detectContiguousRuns(visualColumns).forEach((columnRun) => {
+          if (rowRun.length === 1 && columnRun.length === 1) {
+            return;
+          }
+
+          const from = this.hot._createCellCoords(rowRun.start, columnRun.start);
+          const to = this.hot._createCellCoords(
+            rowRun.start + rowRun.length - 1,
+            columnRun.start + columnRun.length - 1
+          );
+
+          this.mergeRange(this.hot._createCellRange(from, from, to), true, true);
+        });
+      });
+    });
+
+    // No `render()` here on purpose: the Filters plugin always re-renders right after the
+    // `afterFilter` hook, so rendering here would cause a redundant second full render.
+  }
 
   /**
    * `beforeColumnFreeze` / `beforeColumnUnfreeze` hook callback. `manualColumnFreeze`

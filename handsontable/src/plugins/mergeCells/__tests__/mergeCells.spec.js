@@ -2147,4 +2147,163 @@ describe('MergeCells', () => {
       |   :   :   :   :   |
     `).toBeMatchToSelectionPattern();
   });
+
+  describe('integration with the Filters plugin', () => {
+    it('should keep a merged cell rendered (full) after filtering trims the rows above it', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 3, colspan: 2 } // C5:D7
+        ],
+      });
+      const filters = getPlugin('filters');
+
+      // keep the rows that contain the whole merge (A5, A6, A7) -> physical rows 4, 5, 6.
+      // Those rows are trimmed down to the visual rows 0, 1, 2, which used to break the merge.
+      filters.addCondition(0, 'by_value', [['A5', 'A6', 'A7']]);
+      filters.filter();
+
+      await render();
+
+      const TD = getCell(0, 2);
+
+      expect(TD.getAttribute('rowspan')).toBe('3');
+      expect(TD.getAttribute('colspan')).toBe('2');
+    });
+
+    it('should clip a merged cell to the rows that survived filtering', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 3, colspan: 2 } // C5:D7
+        ],
+      });
+      const filters = getPlugin('filters');
+
+      // keep only the first two rows of the merge (A5, A6) -> physical rows 4, 5.
+      filters.addCondition(0, 'by_value', [['A5', 'A6']]);
+      filters.filter();
+
+      await render();
+
+      const TD = getCell(0, 2);
+
+      expect(TD.getAttribute('rowspan')).toBe('2');
+      expect(TD.getAttribute('colspan')).toBe('2');
+    });
+
+    it('should turn a merged cell into a horizontal merge when only its top row survives filtering', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 3, colspan: 2 } // C5:D7
+        ],
+      });
+      const filters = getPlugin('filters');
+
+      // keep only the merge's top row (A5) -> physical row 4.
+      filters.addCondition(0, 'by_value', [['A5']]);
+      filters.filter();
+
+      await render();
+
+      const TD = getCell(0, 2);
+
+      expect(TD.getAttribute('rowspan')).toBe('1');
+      expect(TD.getAttribute('colspan')).toBe('2');
+    });
+
+    it('should drop the merge entirely when all of its rows are filtered out', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 3, colspan: 2 } // C5:D7
+        ],
+      });
+      const filters = getPlugin('filters');
+
+      // keep a row that is not part of the merge (A1) -> physical row 0.
+      filters.addCondition(0, 'by_value', [['A1']]);
+      filters.filter();
+
+      await render();
+
+      const TD = getCell(0, 2);
+
+      expect(TD.getAttribute('rowspan')).toBe(null);
+      expect(TD.getAttribute('colspan')).toBe(null);
+    });
+
+    it('should restore the original merged cell after the filter is cleared', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 3, colspan: 2 } // C5:D7
+        ],
+      });
+      const filters = getPlugin('filters');
+
+      filters.addCondition(0, 'by_value', [['A5']]);
+      filters.filter();
+
+      await render();
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      const TD = getCell(4, 2);
+
+      expect(TD.getAttribute('rowspan')).toBe('3');
+      expect(TD.getAttribute('colspan')).toBe('2');
+    });
+
+    it('should preserve the underlying data when rebuilding merges through filtering', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 3, colspan: 2 } // C5:D7
+        ],
+      });
+      const filters = getPlugin('filters');
+      const anchorValueBefore = getDataAtCell(4, 2);
+
+      filters.addCondition(0, 'by_value', [['A5']]);
+      filters.filter();
+
+      await render();
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      expect(getDataAtCell(4, 2)).toBe(anchorValueBefore);
+    });
+
+    it('should not interfere when the plugin is enabled but there are no merged cells', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [], // plugin enabled, but no merges declared
+      });
+      const filters = getPlugin('filters');
+
+      expect(() => {
+        filters.addCondition(0, 'by_value', [['A5', 'A6']]);
+        filters.filter();
+      }).not.toThrow();
+
+      await render();
+
+      expect(countRows()).toBe(2);
+    });
+  });
 });
