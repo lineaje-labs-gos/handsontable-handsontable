@@ -183,6 +183,17 @@ export class MergeCells extends BasePlugin {
    */
   #filterPhysicalSnapshot: { rows: number[], cols: number[] }[] | null = null;
   /**
+   * `true` only while `#rebuildMergesFromPhysical` re-creates the clipped merges. The
+   * `afterMergeCells` / `afterUnmergeCells` snapshot-sync callbacks must ignore those internal
+   * merge operations (otherwise the snapshot would mutate itself during a rebuild), but they
+   * must still react to genuine user/API merges and unmerges — including the ones that pass
+   * `auto: true` internally (e.g. `mergeSelection`/`unmergeSelection`, used by the context menu
+   * and keyboard shortcut). The `auto` flag alone cannot tell those two cases apart.
+   *
+   * @type {boolean}
+   */
+  #rebuildingFromSnapshot = false;
+  /**
    * `true` once the plugin has finished its initial settings ingestion. Used to skip
    * snapshot/translate during the bootstrap-time column reorders fired by
    * `manualColumnMove: [...]` initial config, where the merge collection is empty
@@ -1613,19 +1624,18 @@ export class MergeCells extends BasePlugin {
   /**
    * `afterMergeCells` hook callback. While a filter is active, keeps the captured snapshot in
    * sync with merges created by the user/API, so they are not discarded on the next `filter()`
-   * call and survive clearing the filter. Plugin-internal (`auto`) merges are ignored — those
-   * are produced by `#rebuildMergesFromPhysical` and `generateFromSettings` themselves.
+   * call and survive clearing the filter. Merges produced by our own snapshot rebuild are
+   * skipped via `#rebuildingFromSnapshot` (the `auto` flag cannot be used here, because the
+   * user-facing `mergeSelection`/context-menu path also merges with `auto: true`).
    *
    * @param {CellRange} _cellRange The merged range (unused).
    * @param {{ row: number, col: number, rowspan: number, colspan: number }} mergeParent The merged cell.
-   * @param {boolean} [auto] `true` when triggered internally by the plugin.
    */
   #onAfterMergeCells = (
     _cellRange: CellRange,
-    mergeParent: { row: number, col: number, rowspan: number, colspan: number },
-    auto?: boolean
+    mergeParent: { row: number, col: number, rowspan: number, colspan: number }
   ) => {
-    if (auto || this.#filterPhysicalSnapshot === null) {
+    if (this.#rebuildingFromSnapshot || this.#filterPhysicalSnapshot === null) {
       return;
     }
 
@@ -1655,13 +1665,14 @@ export class MergeCells extends BasePlugin {
   /**
    * `afterUnmergeCells` hook callback. While a filter is active, drops the snapshot entries that
    * overlap the unmerged range, so user/API unmerges are not resurrected on the next `filter()`
-   * call or when the filter is cleared. Plugin-internal (`auto`) unmerges are ignored.
+   * call or when the filter is cleared. This also covers the `auto: true` unmerge that
+   * `mergeSelection` runs to clear overlapped merges before creating a new one. Unmerges done by
+   * our own snapshot rebuild are skipped via `#rebuildingFromSnapshot`.
    *
    * @param {CellRange} cellRange The unmerged range.
-   * @param {boolean} [auto] `true` when triggered internally by the plugin.
    */
-  #onAfterUnmergeCells = (cellRange: CellRange, auto?: boolean) => {
-    if (auto || this.#filterPhysicalSnapshot === null) {
+  #onAfterUnmergeCells = (cellRange: CellRange) => {
+    if (this.#rebuildingFromSnapshot || this.#filterPhysicalSnapshot === null) {
       return;
     }
 
@@ -1736,61 +1747,69 @@ export class MergeCells extends BasePlugin {
   #rebuildMergesFromPhysical(snapshot: { rows: number[], cols: number[] }[]) {
     const { rowIndexMapper: rowMapper, columnIndexMapper: columnMapper } = this.hot;
 
-    this.clearCollections();
+    // Suppress snapshot-sync callbacks: the `mergeRange` calls below are internal and must not
+    // feed back into the snapshot we are rebuilding from.
+    this.#rebuildingFromSnapshot = true;
 
-    // Reset leftover `hidden`/`spanned` cell meta within the original merge areas, so cells
-    // no longer covered by a (clipped) merge render normally.
-    snapshot.forEach(({ rows, cols }) => {
-      rows.forEach((physicalRow) => {
-        const visualRow = rowMapper.getVisualFromPhysicalIndex(physicalRow);
+    try {
+      this.clearCollections();
 
-        if (visualRow === null) {
+      // Reset leftover `hidden`/`spanned` cell meta within the original merge areas, so cells
+      // no longer covered by a (clipped) merge render normally.
+      snapshot.forEach(({ rows, cols }) => {
+        rows.forEach((physicalRow) => {
+          const visualRow = rowMapper.getVisualFromPhysicalIndex(physicalRow);
+
+          if (visualRow === null) {
+            return;
+          }
+
+          cols.forEach((physicalColumn) => {
+            const visualColumn = columnMapper.getVisualFromPhysicalIndex(physicalColumn);
+
+            if (visualColumn === null) {
+              return;
+            }
+
+            this.hot.removeCellMeta(visualRow, visualColumn, 'hidden');
+            this.hot.removeCellMeta(visualRow, visualColumn, 'spanned');
+          });
+        });
+      });
+
+      snapshot.forEach(({ rows, cols }) => {
+        const visualRows = rows
+          .map(physicalRow => rowMapper.getVisualFromPhysicalIndex(physicalRow))
+          .filter((visualRow): visualRow is number => visualRow !== null && visualRow >= 0)
+          .sort((a, b) => a - b);
+        const visualColumns = cols
+          .map(physicalColumn => columnMapper.getVisualFromPhysicalIndex(physicalColumn))
+          .filter((visualColumn): visualColumn is number => visualColumn !== null && visualColumn >= 0)
+          .sort((a, b) => a - b);
+
+        if (visualRows.length === 0 || visualColumns.length === 0) {
           return;
         }
 
-        cols.forEach((physicalColumn) => {
-          const visualColumn = columnMapper.getVisualFromPhysicalIndex(physicalColumn);
+        MergedCellsCollection.detectContiguousRuns(visualRows).forEach((rowRun) => {
+          MergedCellsCollection.detectContiguousRuns(visualColumns).forEach((columnRun) => {
+            if (rowRun.length === 1 && columnRun.length === 1) {
+              return;
+            }
 
-          if (visualColumn === null) {
-            return;
-          }
+            const from = this.hot._createCellCoords(rowRun.start, columnRun.start);
+            const to = this.hot._createCellCoords(
+              rowRun.start + rowRun.length - 1,
+              columnRun.start + columnRun.length - 1
+            );
 
-          this.hot.removeCellMeta(visualRow, visualColumn, 'hidden');
-          this.hot.removeCellMeta(visualRow, visualColumn, 'spanned');
+            this.mergeRange(this.hot._createCellRange(from, from, to), true, true);
+          });
         });
       });
-    });
-
-    snapshot.forEach(({ rows, cols }) => {
-      const visualRows = rows
-        .map(physicalRow => rowMapper.getVisualFromPhysicalIndex(physicalRow))
-        .filter((visualRow): visualRow is number => visualRow !== null && visualRow >= 0)
-        .sort((a, b) => a - b);
-      const visualColumns = cols
-        .map(physicalColumn => columnMapper.getVisualFromPhysicalIndex(physicalColumn))
-        .filter((visualColumn): visualColumn is number => visualColumn !== null && visualColumn >= 0)
-        .sort((a, b) => a - b);
-
-      if (visualRows.length === 0 || visualColumns.length === 0) {
-        return;
-      }
-
-      MergedCellsCollection.detectContiguousRuns(visualRows).forEach((rowRun) => {
-        MergedCellsCollection.detectContiguousRuns(visualColumns).forEach((columnRun) => {
-          if (rowRun.length === 1 && columnRun.length === 1) {
-            return;
-          }
-
-          const from = this.hot._createCellCoords(rowRun.start, columnRun.start);
-          const to = this.hot._createCellCoords(
-            rowRun.start + rowRun.length - 1,
-            columnRun.start + columnRun.length - 1
-          );
-
-          this.mergeRange(this.hot._createCellRange(from, from, to), true, true);
-        });
-      });
-    });
+    } finally {
+      this.#rebuildingFromSnapshot = false;
+    }
 
     // No `render()` here on purpose: the Filters plugin always re-renders right after the
     // `afterFilter` hook, so rendering here would cause a redundant second full render.

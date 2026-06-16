@@ -2408,5 +2408,69 @@ describe('MergeCells', () => {
       expect(getCell(0, 2).getAttribute('rowspan')).toBe('2');
       expect(getCell(0, 2).getAttribute('colspan')).toBe('2');
     });
+
+    it('should sync the snapshot when unmerging via unmergeSelection (auto path) while filtered', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 2, colspan: 2 } // C5:D6
+        ],
+      });
+      const filters = getPlugin('filters');
+      const mergeCells = getPlugin('mergeCells');
+
+      // keep physical rows 0, 1, 4, 5 -> visual rows 0, 1, 2, 3
+      filters.addCondition(4, 'by_value', [['E1', 'E2', 'E5', 'E6']]);
+      filters.filter();
+
+      await render();
+
+      // C5:D6 is now at visual rows 2, 3 — unmerge it through the `auto: true` selection API
+      // (the same path the context menu / Ctrl+M use).
+      await selectCell(2, 2, 3, 3);
+      mergeCells.unmergeSelection();
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      expect(getCell(4, 2).getAttribute('rowspan')).toBe(null);
+      expect(getCell(4, 2).getAttribute('colspan')).toBe(null);
+    });
+
+    it('should sync the snapshot when merging over an existing merge via mergeSelection while filtered', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 2, colspan: 2 } // C5:D6
+        ],
+      });
+      const filters = getPlugin('filters');
+      const mergeCells = getPlugin('mergeCells');
+
+      filters.addCondition(4, 'by_value', [['E1', 'E2', 'E5', 'E6']]);
+      filters.filter();
+
+      await render();
+
+      // expand the merge to C5:E6 — mergeSelection first unmerges C5:D6 with `auto: true`,
+      // which must drop the stale C5:D6 entry from the snapshot.
+      await selectCell(2, 2, 3, 4);
+      mergeCells.mergeSelection();
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      const TD = getCell(4, 2);
+
+      // the restored merge must be the new C5:E6, not the stale C5:D6
+      expect(TD.getAttribute('rowspan')).toBe('2');
+      expect(TD.getAttribute('colspan')).toBe('3');
+    });
   });
 });
