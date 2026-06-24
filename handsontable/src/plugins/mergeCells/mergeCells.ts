@@ -183,6 +183,15 @@ export class MergeCells extends BasePlugin {
    */
   #filterPhysicalSnapshot: { rows: number[], cols: number[] }[] | null = null;
   /**
+   * Bridges the snapshot across the `unmergeRange`→`mergeRange` pair run by `mergeSelection`.
+   * Non-`null` (an array) only for the duration of that call while a filter is active: the
+   * auto-unmerge stashes the dropped entries here so the following re-merge can union their full
+   * physical rows/columns (including the filter-hidden ones) back into the new entry.
+   *
+   * @type {Array<{ rows: number[], cols: number[] }> | null}
+   */
+  #remergeSnapshotReclaim: { rows: number[], cols: number[] }[] | null = null;
+  /**
    * `true` only while `#rebuildMergesFromPhysical` re-creates the clipped merges. The
    * `afterMergeCells` / `afterUnmergeCells` snapshot-sync callbacks must ignore those internal
    * merge operations (otherwise the snapshot would mutate itself during a rebuild), but they
@@ -481,8 +490,16 @@ export class MergeCells extends BasePlugin {
 
     const { from, to } = cellRange;
 
-    this.unmergeRange(cellRange, true);
-    this.mergeRange(cellRange);
+    // Let the auto-unmerge below hand its dropped entries to the following re-merge, so a merge
+    // re-created over a filter-clipped one keeps the hidden rows instead of trimming to the visible.
+    this.#remergeSnapshotReclaim = this.#filterPhysicalSnapshot === null ? null : [];
+
+    try {
+      this.unmergeRange(cellRange, true);
+      this.mergeRange(cellRange);
+    } finally {
+      this.#remergeSnapshotReclaim = null;
+    }
 
     if (from.row !== null && from.col !== null && to.row !== null && to.col !== null) {
       this.hot.selectCell(from.row, from.col, to.row, to.col, false);
@@ -1460,6 +1477,7 @@ export class MergeCells extends BasePlugin {
    */
   #onAfterCreateCol = (column: number, count: number) => {
     this.mergedCellsCollection.shiftCollections('right', column, count);
+    this.#invalidateFilterSnapshot();
   };
 
   /**
@@ -1470,6 +1488,7 @@ export class MergeCells extends BasePlugin {
    */
   #onAfterRemoveCol = (column: number, count: number) => {
     this.mergedCellsCollection.shiftCollections('left', column, count);
+    this.#invalidateFilterSnapshot();
   };
 
   /**
@@ -1485,6 +1504,7 @@ export class MergeCells extends BasePlugin {
     }
 
     this.mergedCellsCollection.shiftCollections('down', row, count);
+    this.#invalidateFilterSnapshot();
   };
 
   /**
@@ -1495,7 +1515,17 @@ export class MergeCells extends BasePlugin {
    */
   #onAfterRemoveRow = (row: number, count: number) => {
     this.mergedCellsCollection.shiftCollections('up', row, count);
+    this.#invalidateFilterSnapshot();
   };
+
+  /**
+   * Drops the filter snapshot after a structural change. It holds physical indexes captured before
+   * the edit, so leaving it would make `#rebuildMergesFromPhysical` restore merges onto stale rows
+   * once the filter is cleared — the already-shifted live merges stay authoritative instead.
+   */
+  #invalidateFilterSnapshot() {
+    this.#filterPhysicalSnapshot = null;
+  }
 
   /**
    * `beforeColumnMove` hook callback. Captures physical column positions of every merge
@@ -1657,6 +1687,32 @@ export class MergeCells extends BasePlugin {
       }
     }
 
+    // Re-merge over a filter-clipped merge: fold the original physical rows/columns (including the
+    // ones the filter hid, which the visible re-merge can no longer map) back into the new entry.
+    const reclaim = this.#remergeSnapshotReclaim;
+
+    if (reclaim !== null && reclaim.length > 0) {
+      const rowSet = new Set(rows);
+      const colSet = new Set(cols);
+
+      reclaim.forEach((entry) => {
+        entry.rows.forEach((row) => {
+          if (!rowSet.has(row)) {
+            rowSet.add(row);
+            rows.push(row);
+          }
+        });
+        entry.cols.forEach((col) => {
+          if (!colSet.has(col)) {
+            colSet.add(col);
+            cols.push(col);
+          }
+        });
+      });
+
+      reclaim.length = 0;
+    }
+
     if (rows.length > 0 && cols.length > 0) {
       this.#filterPhysicalSnapshot.push({ rows, cols });
     }
@@ -1701,9 +1757,21 @@ export class MergeCells extends BasePlugin {
       }
     }
 
-    this.#filterPhysicalSnapshot = this.#filterPhysicalSnapshot.filter(entry =>
-      !(entry.rows.some(row => physicalRows.has(row)) && entry.cols.some(col => physicalColumns.has(col)))
-    );
+    // Mirror the live removal: only drop a merge whose top-left corner sits inside the range
+    // (`getWithinRange` with `countPartials = false`), otherwise a merge that overlaps the box but
+    // starts outside it stays on screen yet loses its snapshot entry. The corner's physical coords
+    // are the first captured row/col, since the capture loops start at the merge's `row`/`col`.
+    this.#filterPhysicalSnapshot = this.#filterPhysicalSnapshot.filter((entry) => {
+      const drop = physicalRows.has(entry.rows[0]) && physicalColumns.has(entry.cols[0]);
+
+      // Inside a `mergeSelection`, hand the dropped entry to the upcoming re-merge so it can fold
+      // the original (possibly filter-hidden) rows/columns back in.
+      if (drop && this.#remergeSnapshotReclaim !== null) {
+        this.#remergeSnapshotReclaim.push(entry);
+      }
+
+      return !drop;
+    });
   };
 
   /**
@@ -1754,25 +1822,31 @@ export class MergeCells extends BasePlugin {
     try {
       this.clearCollections();
 
-      // Reset leftover `hidden`/`spanned` cell meta within the original merge areas, so cells
-      // no longer covered by a (clipped) merge render normally.
+      // Reset leftover `hidden`/`spanned` cell meta within the original merge areas, so cells no
+      // longer covered by a (clipped) merge render normally. Trimmed cells have no visual index, so
+      // clear them straight on the meta manager by physical index — otherwise they would resurface
+      // as merged cells once the rows/columns are revealed by other means (e.g. `trimRows` off).
+      type HotWithMetaManager = {
+        _getMetaManager(): {
+          removeCellMeta(physicalRow: number, physicalColumn: number, key: string): void;
+        };
+      };
+      const metaManager = (this.hot as unknown as HotWithMetaManager)._getMetaManager();
+
       snapshot.forEach(({ rows, cols }) => {
         rows.forEach((physicalRow) => {
           const visualRow = rowMapper.getVisualFromPhysicalIndex(physicalRow);
 
-          if (visualRow === null) {
-            return;
-          }
-
           cols.forEach((physicalColumn) => {
             const visualColumn = columnMapper.getVisualFromPhysicalIndex(physicalColumn);
 
-            if (visualColumn === null) {
-              return;
+            if (visualRow === null || visualColumn === null) {
+              metaManager.removeCellMeta(physicalRow, physicalColumn, 'hidden');
+              metaManager.removeCellMeta(physicalRow, physicalColumn, 'spanned');
+            } else {
+              this.hot.removeCellMeta(visualRow, visualColumn, 'hidden');
+              this.hot.removeCellMeta(visualRow, visualColumn, 'spanned');
             }
-
-            this.hot.removeCellMeta(visualRow, visualColumn, 'hidden');
-            this.hot.removeCellMeta(visualRow, visualColumn, 'spanned');
           });
         });
       });
@@ -1791,8 +1865,10 @@ export class MergeCells extends BasePlugin {
           return;
         }
 
+        const columnRuns = MergedCellsCollection.detectContiguousRuns(visualColumns);
+
         MergedCellsCollection.detectContiguousRuns(visualRows).forEach((rowRun) => {
-          MergedCellsCollection.detectContiguousRuns(visualColumns).forEach((columnRun) => {
+          columnRuns.forEach((columnRun) => {
             if (rowRun.length === 1 && columnRun.length === 1) {
               return;
             }
