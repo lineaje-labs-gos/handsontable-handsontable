@@ -2523,8 +2523,9 @@ describe('MergeCells', () => {
 
       await render();
 
-      // remove the top row while filtering — `shiftCollections` moves the live merge up to row 3,
-      // but the snapshot still holds the old physical rows 4, 5 and must not be used to rebuild.
+      // remove the top row while filtering — `shiftCollections` moves the live merge up to row 3
+      // and the snapshot's physical rows are re-synced (4, 5 → 3, 4), so a rebuild lands on the
+      // shifted rows, not the stale ones.
       await alter('remove_row', 0, 1);
 
       filters.clearConditions();
@@ -2565,6 +2566,118 @@ describe('MergeCells', () => {
 
       expect(meta.hidden).not.toBe(true);
       expect(meta.spanned).not.toBe(true);
+    });
+
+    it('should keep filter-hidden rows when re-merging a clipped merge whose top row is hidden', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 3, colspan: 2 } // C5:D7, physical rows 4, 5, 6
+        ],
+      });
+      const filters = getPlugin('filters');
+      const mergeCells = getPlugin('mergeCells');
+
+      // hide the merge's top physical row 4 (E5), so the clipped merge starts lower (physical 5, 6)
+      // and no longer begins at the captured corner `rows[0]` === 4.
+      filters.addCondition(4, 'by_value', [['E1', 'E2', 'E3', 'E4', 'E6', 'E7', 'E8', 'E9', 'E10']]);
+      filters.filter();
+
+      await render();
+
+      // re-merge the still-visible part — the snapshot entry must be matched by its first visible
+      // row (5), not the hidden corner (4), otherwise it gets orphaned and the hidden row is lost.
+      await selectCell(4, 2, 5, 3);
+      mergeCells.mergeSelection();
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      const TD = getCell(4, 2);
+
+      // the full C5:D7 merge (including the formerly-hidden top row 4) is restored
+      expect(TD.getAttribute('rowspan')).toBe('3');
+      expect(TD.getAttribute('colspan')).toBe('2');
+    });
+
+    it('should keep filter-hidden rows of a clipped merge after removing a row while filtered', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 3, colspan: 2 } // C5:D7, physical rows 4, 5, 6
+        ],
+      });
+      const filters = getPlugin('filters');
+
+      // hide physical row 6 (E7), so the merge is clipped to its two visible rows (physical 4, 5)
+      // while the snapshot still holds the full rows 4, 5, 6.
+      filters.addCondition(4, 'by_value', [['E1', 'E2', 'E3', 'E4', 'E5', 'E6', 'E8', 'E9', 'E10']]);
+      filters.filter();
+
+      await render();
+
+      // remove a row above the merge while filtered — the snapshot must be re-synced (4, 5, 6 →
+      // 3, 4, 5), not dropped, otherwise the re-filter below recaptures from the clipped live merge.
+      await alter('remove_row', 0, 1);
+
+      // re-apply the filter while still clipped — a dropped snapshot would be recaptured here from
+      // the visible-only merge, baking out the hidden row permanently.
+      filters.filter();
+
+      await render();
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      const TD = getCell(3, 2);
+
+      // the full merge (including the formerly-hidden row) survives, shifted up by the removed row
+      expect(TD.getAttribute('rowspan')).toBe('3');
+      expect(TD.getAttribute('colspan')).toBe('2');
+    });
+
+    it('should not resurrect a merge on filter clear when mergeSelection unmerged then failed to merge', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 4, col: 2, rowspan: 3, colspan: 2 } // C5:D7, physical rows 4, 5, 6
+        ],
+      });
+      const filters = getPlugin('filters');
+      const mergeCells = getPlugin('mergeCells');
+
+      // hide physical row 6 (E7), so the merge is clipped to its two visible rows (physical 4, 5)
+      filters.addCondition(4, 'by_value', [['E1', 'E2', 'E3', 'E4', 'E5', 'E6', 'E8', 'E9', 'E10']]);
+      filters.filter();
+
+      await render();
+
+      // mergeSelection on a single cell (the merge's corner): unmergeRange removes the live merge and
+      // drops its snapshot entry into the reclaim buffer, then mergeRange bails on `validateSetting`
+      // (single cell), so the entry is discarded with the buffer in the `finally`.
+      const corner = hot()._createCellCoords(4, 2);
+
+      mergeCells.mergeSelection(hot()._createCellRange(corner, corner, corner));
+
+      // the merge is gone from the live collection right away
+      expect(mergeCells.mergedCellsCollection.get(4, 2)).toBe(false);
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      // clearing the filter must not rebuild the destroyed merge — the snapshot dropped it together
+      // with the live removal, so folding the reclaim back would have wrongly resurrected it here.
+      expect(mergeCells.mergedCellsCollection.get(4, 2)).toBe(false);
+      expect(getCell(4, 2).getAttribute('rowspan')).toBe(null);
     });
   });
 });

@@ -1477,7 +1477,7 @@ export class MergeCells extends BasePlugin {
    */
   #onAfterCreateCol = (column: number, count: number) => {
     this.mergedCellsCollection.shiftCollections('right', column, count);
-    this.#invalidateFilterSnapshot();
+    this.#shiftFilterSnapshotForInsert('cols', this.hot.toPhysicalColumn(column), count);
   };
 
   /**
@@ -1485,10 +1485,11 @@ export class MergeCells extends BasePlugin {
    *
    * @param {number} column Column index.
    * @param {number} count Number of removed columns.
+   * @param {number[]} removedPhysicalColumns Physical indexes of the removed columns.
    */
-  #onAfterRemoveCol = (column: number, count: number) => {
+  #onAfterRemoveCol = (column: number, count: number, removedPhysicalColumns: number[]) => {
     this.mergedCellsCollection.shiftCollections('left', column, count);
-    this.#invalidateFilterSnapshot();
+    this.#shiftFilterSnapshotForRemove('cols', removedPhysicalColumns);
   };
 
   /**
@@ -1504,7 +1505,7 @@ export class MergeCells extends BasePlugin {
     }
 
     this.mergedCellsCollection.shiftCollections('down', row, count);
-    this.#invalidateFilterSnapshot();
+    this.#shiftFilterSnapshotForInsert('rows', this.hot.toPhysicalRow(row), count);
   };
 
   /**
@@ -1512,19 +1513,67 @@ export class MergeCells extends BasePlugin {
    *
    * @param {number} row Row index.
    * @param {number} count Number of removed rows.
+   * @param {number[]} removedPhysicalRows Physical indexes of the removed rows.
    */
-  #onAfterRemoveRow = (row: number, count: number) => {
+  #onAfterRemoveRow = (row: number, count: number, removedPhysicalRows: number[]) => {
     this.mergedCellsCollection.shiftCollections('up', row, count);
-    this.#invalidateFilterSnapshot();
+    this.#shiftFilterSnapshotForRemove('rows', removedPhysicalRows);
   };
 
   /**
-   * Drops the filter snapshot after a structural change. It holds physical indexes captured before
-   * the edit, so leaving it would make `#rebuildMergesFromPhysical` restore merges onto stale rows
-   * once the filter is cleared — the already-shifted live merges stay authoritative instead.
+   * Shifts the filter snapshot's physical indexes up after an insert, so a snapshot captured before
+   * the edit keeps pointing at the same cells. No-op without an active snapshot.
+   *
+   * @param {'rows' | 'cols'} axis Physical axis of each entry to shift.
+   * @param {number | null} startPhysicalIndex Physical index from which existing indexes move up;
+   * `null` (an append past the end) skips the shift.
+   * @param {number} count Number of inserted indexes.
    */
-  #invalidateFilterSnapshot() {
-    this.#filterPhysicalSnapshot = null;
+  #shiftFilterSnapshotForInsert(axis: 'rows' | 'cols', startPhysicalIndex: number | null, count: number) {
+    if (this.#filterPhysicalSnapshot === null || startPhysicalIndex === null || count === 0) {
+      return;
+    }
+
+    this.#filterPhysicalSnapshot.forEach((entry) => {
+      const indexes = entry[axis];
+
+      for (let i = 0; i < indexes.length; i++) {
+        if (indexes[i] >= startPhysicalIndex) {
+          indexes[i] += count;
+        }
+      }
+    });
+  }
+
+  /**
+   * Drops removed physical indexes from the filter snapshot and shifts the survivors down, so a
+   * snapshot captured before the edit keeps pointing at the same cells. Replaces the previous
+   * drop-on-edit, which let the next `filter()` recapture from the already-clipped live merges and
+   * permanently lose filter-hidden lines; entries left without rows or columns are removed, and it
+   * no-ops without an active snapshot.
+   *
+   * @param {'rows' | 'cols'} axis Physical axis of each entry to shift.
+   * @param {number[]} removedPhysicalIndexes Physical indexes removed by the edit.
+   */
+  #shiftFilterSnapshotForRemove(axis: 'rows' | 'cols', removedPhysicalIndexes: number[]) {
+    if (this.#filterPhysicalSnapshot === null || removedPhysicalIndexes.length === 0) {
+      return;
+    }
+
+    const removed = [...removedPhysicalIndexes].sort((a, b) => a - b);
+    const removedSet = new Set(removed);
+
+    this.#filterPhysicalSnapshot = this.#filterPhysicalSnapshot
+      .map((entry) => {
+        const shifted = entry[axis]
+          .filter(index => !removedSet.has(index))
+          .map(index => index - removed.filter(removedIndex => removedIndex < index).length);
+
+        return axis === 'rows'
+          ? { rows: shifted, cols: entry.cols }
+          : { rows: entry.rows, cols: shifted };
+      })
+      .filter(entry => entry.rows.length > 0 && entry.cols.length > 0);
   }
 
   /**
@@ -1757,12 +1806,27 @@ export class MergeCells extends BasePlugin {
       }
     }
 
+    const { rowIndexMapper: rowMapper, columnIndexMapper: columnMapper } = this.hot;
+
     // Mirror the live removal: only drop a merge whose top-left corner sits inside the range
     // (`getWithinRange` with `countPartials = false`), otherwise a merge that overlaps the box but
-    // starts outside it stays on screen yet loses its snapshot entry. The corner's physical coords
-    // are the first captured row/col, since the capture loops start at the merge's `row`/`col`.
+    // starts outside it stays on screen yet loses its snapshot entry. The corner is the first still
+    // visible row/col, not `rows[0]`/`cols[0]`: a filter can hide the original top, so the clipped
+    // merge — and the unmerge range — starts lower, and keying off `rows[0]` would orphan the entry.
     this.#filterPhysicalSnapshot = this.#filterPhysicalSnapshot.filter((entry) => {
-      const drop = physicalRows.has(entry.rows[0]) && physicalColumns.has(entry.cols[0]);
+      const visibleRow = entry.rows.find((physicalRow) => {
+        const visualRow = rowMapper.getVisualFromPhysicalIndex(physicalRow);
+
+        return visualRow !== null && visualRow >= 0;
+      });
+      const visibleColumn = entry.cols.find((physicalColumn) => {
+        const visualColumn = columnMapper.getVisualFromPhysicalIndex(physicalColumn);
+
+        return visualColumn !== null && visualColumn >= 0;
+      });
+
+      const drop = visibleRow !== undefined && visibleColumn !== undefined &&
+        physicalRows.has(visibleRow) && physicalColumns.has(visibleColumn);
 
       // Inside a `mergeSelection`, hand the dropped entry to the upcoming re-merge so it can fold
       // the original (possibly filter-hidden) rows/columns back in.
