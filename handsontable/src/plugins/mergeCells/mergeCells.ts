@@ -176,8 +176,10 @@ export class MergeCells extends BasePlugin {
    * Snapshot of the full merge set (in physical row/column indexes) captured the first time
    * a filter is applied from a clean state. Filtering trims rows, which reshuffles visual
    * indexes; this snapshot lets us rebuild merges clipped to the visible rows and restore
-   * the original merges once all filter conditions are cleared. `null` whenever no filter
-   * is active, so a grid without merges (or without filtering) pays nothing.
+   * the original merges once all filter conditions are cleared. `null` whenever no filter is
+   * active. While a filter is active it is non-`null` even with no merges (an empty array), so
+   * merges created during the filter are tracked; the rebuild short-circuits when there is nothing
+   * to clip, so a grid without merges still pays nothing.
    *
    * @type {Array<{ rows: number[], cols: number[] }> | null}
    */
@@ -202,6 +204,15 @@ export class MergeCells extends BasePlugin {
    * @type {boolean}
    */
   #rebuildingFromSnapshot = false;
+  /**
+   * Live merge clips removed by the in-progress `unmergeRange`, captured (in visual coordinates)
+   * before `afterUnmergeCells` fires so the snapshot sync can edit each one out of its owning entry
+   * individually. Empty outside that call. A filter-clipped entry can map to several live clips, so a
+   * single whole-entry match would desync the siblings.
+   *
+   * @type {Array<{ row: number, col: number, rowspan: number, colspan: number }>}
+   */
+  #unmergedClips: { row: number, col: number, rowspan: number, colspan: number }[] = [];
   /**
    * `true` once the plugin has finished its initial settings ingestion. Used to skip
    * snapshot/translate during the bootstrap-time column reorders fired by
@@ -639,7 +650,13 @@ export class MergeCells extends BasePlugin {
       this.hot.removeCellMeta(currentCollection.row, currentCollection.col, 'spanned');
     });
 
+    // Hand the removed clips (visual coords) to the `afterUnmergeCells` snapshot sync, which needs
+    // each one individually to edit it out of its owning entry. Cleared right after the hook.
+    this.#unmergedClips = mergedCells.map(({ row, col, rowspan, colspan }) => ({ row, col, rowspan, colspan }));
+
     this.hot.runHooks('afterUnmergeCells', cellRange, auto);
+
+    this.#unmergedClips = [];
     this.hot.render();
   }
 
@@ -1522,7 +1539,10 @@ export class MergeCells extends BasePlugin {
 
   /**
    * Shifts the filter snapshot's physical indexes up after an insert, so a snapshot captured before
-   * the edit keeps pointing at the same cells. No-op without an active snapshot.
+   * the edit keeps pointing at the same cells. An insert that lands strictly inside a merge grows it
+   * (mirroring `MergedCellCoords.shift`), so the new indexes are folded into a straddled entry too —
+   * otherwise it would keep a hole there and split into separate clips on the next rebuild. No-op
+   * without an active snapshot.
    *
    * @param {'rows' | 'cols'} axis Physical axis of each entry to shift.
    * @param {number | null} startPhysicalIndex Physical index from which existing indexes move up;
@@ -1536,10 +1556,18 @@ export class MergeCells extends BasePlugin {
 
     this.#filterPhysicalSnapshot.forEach((entry) => {
       const indexes = entry[axis];
+      const grows = indexes.some(index => index < startPhysicalIndex) &&
+        indexes.some(index => index >= startPhysicalIndex);
 
       for (let i = 0; i < indexes.length; i++) {
         if (indexes[i] >= startPhysicalIndex) {
           indexes[i] += count;
+        }
+      }
+
+      if (grows) {
+        for (let offset = 0; offset < count; offset++) {
+          indexes.push(startPhysicalIndex + offset);
         }
       }
     });
@@ -1669,10 +1697,12 @@ export class MergeCells extends BasePlugin {
   /**
    * `beforeFilter` hook callback. Captures the full merge set (in physical coordinates) the
    * first time a filter runs from a clean (unfiltered) state, so the merges can later be
-   * rebuilt against whatever rows remain visible. No-op when there are no merged cells.
+   * rebuilt against whatever rows remain visible. Runs even with no merges (capturing an empty
+   * snapshot): merges created later while the filter is active are then tracked by
+   * `#onAfterMergeCells`, instead of being captured already-clipped on the next `filter()`.
    */
   #onBeforeFilter = () => {
-    if (this.#filterPhysicalSnapshot !== null || this.mergedCellsCollection.mergedCells.length === 0) {
+    if (this.#filterPhysicalSnapshot !== null) {
       return;
     }
 
@@ -1720,19 +1750,28 @@ export class MergeCells extends BasePlugin {
 
     const rows = [];
     const cols = [];
+    const firstPhysicalRow = this.hot.toPhysicalRow(mergeParent.row);
+    const lastPhysicalRow = this.hot.toPhysicalRow(mergeParent.row + mergeParent.rowspan - 1);
+    const firstPhysicalColumn = this.hot.toPhysicalColumn(mergeParent.col);
+    const lastPhysicalColumn = this.hot.toPhysicalColumn(mergeParent.col + mergeParent.colspan - 1);
 
-    for (let r = mergeParent.row; r < mergeParent.row + mergeParent.rowspan; r++) {
-      const physicalRow = this.hot.toPhysicalRow(r);
+    // Capture the full physical span between the (visible) endpoints, not just the visible lines: a
+    // merge created while a filter hides rows inside its visual range would otherwise be stored
+    // non-contiguous and split — or vanish — once the filter clears.
+    if (firstPhysicalRow !== null && lastPhysicalRow !== null) {
+      const fromRow = Math.min(firstPhysicalRow, lastPhysicalRow);
+      const toRow = Math.max(firstPhysicalRow, lastPhysicalRow);
 
-      if (physicalRow !== null) {
-        rows.push(physicalRow);
+      for (let p = fromRow; p <= toRow; p++) {
+        rows.push(p);
       }
     }
-    for (let c = mergeParent.col; c < mergeParent.col + mergeParent.colspan; c++) {
-      const physicalColumn = this.hot.toPhysicalColumn(c);
+    if (firstPhysicalColumn !== null && lastPhysicalColumn !== null) {
+      const fromColumn = Math.min(firstPhysicalColumn, lastPhysicalColumn);
+      const toColumn = Math.max(firstPhysicalColumn, lastPhysicalColumn);
 
-      if (physicalColumn !== null) {
-        cols.push(physicalColumn);
+      for (let p = fromColumn; p <= toColumn; p++) {
+        cols.push(p);
       }
     }
 
@@ -1768,74 +1807,100 @@ export class MergeCells extends BasePlugin {
   };
 
   /**
-   * `afterUnmergeCells` hook callback. While a filter is active, drops the snapshot entries that
-   * overlap the unmerged range, so user/API unmerges are not resurrected on the next `filter()`
-   * call or when the filter is cleared. This also covers the `auto: true` unmerge that
-   * `mergeSelection` runs to clear overlapped merges before creating a new one. Unmerges done by
-   * our own snapshot rebuild are skipped via `#rebuildingFromSnapshot`.
+   * `afterUnmergeCells` hook callback. While a filter is active, edits each unmerged clip out of the
+   * snapshot, so user/API unmerges are not resurrected on the next `filter()` call or when the filter
+   * is cleared. This also covers the `auto: true` unmerge that `mergeSelection` runs to clear
+   * overlapped merges before creating a new one. Unmerges done by our own snapshot rebuild are
+   * skipped via `#rebuildingFromSnapshot`.
    *
-   * @param {CellRange} cellRange The unmerged range.
+   * Filtering can split one snapshot entry into several live clips, so the sync works per removed
+   * clip (captured in `#unmergedClips`): it finds the entry that owns the clip by its physical corner
+   * and carves out just that clip's rows or columns, dropping the entry only when the clip was its
+   * sole visible part. Keying off the entry as a whole would either drop siblings or leave a removed
+   * clip to be resurrected on the next rebuild.
    */
-  #onAfterUnmergeCells = (cellRange: CellRange) => {
+  #onAfterUnmergeCells = () => {
     if (this.#rebuildingFromSnapshot || this.#filterPhysicalSnapshot === null) {
       return;
     }
 
-    const topStart = cellRange.getTopStartCorner();
-    const bottomEnd = cellRange.getBottomEndCorner();
-
-    if (topStart.row === null || topStart.col === null || bottomEnd.row === null || bottomEnd.col === null) {
-      return;
-    }
-
-    const physicalRows = new Set<number>();
-    const physicalColumns = new Set<number>();
-
-    for (let r = topStart.row; r <= bottomEnd.row; r++) {
-      const physicalRow = this.hot.toPhysicalRow(r);
-
-      if (physicalRow !== null) {
-        physicalRows.add(physicalRow);
-      }
-    }
-    for (let c = topStart.col; c <= bottomEnd.col; c++) {
-      const physicalColumn = this.hot.toPhysicalColumn(c);
-
-      if (physicalColumn !== null) {
-        physicalColumns.add(physicalColumn);
-      }
-    }
-
     const { rowIndexMapper: rowMapper, columnIndexMapper: columnMapper } = this.hot;
+    const isVisibleRow = (physicalRow: number) => {
+      const visualRow = rowMapper.getVisualFromPhysicalIndex(physicalRow);
 
-    // Mirror the live removal: only drop a merge whose top-left corner sits inside the range
-    // (`getWithinRange` with `countPartials = false`), otherwise a merge that overlaps the box but
-    // starts outside it stays on screen yet loses its snapshot entry. The corner is the first still
-    // visible row/col, not `rows[0]`/`cols[0]`: a filter can hide the original top, so the clipped
-    // merge — and the unmerge range — starts lower, and keying off `rows[0]` would orphan the entry.
-    this.#filterPhysicalSnapshot = this.#filterPhysicalSnapshot.filter((entry) => {
-      const visibleRow = entry.rows.find((physicalRow) => {
-        const visualRow = rowMapper.getVisualFromPhysicalIndex(physicalRow);
+      return visualRow !== null && visualRow >= 0;
+    };
+    const isVisibleColumn = (physicalColumn: number) => {
+      const visualColumn = columnMapper.getVisualFromPhysicalIndex(physicalColumn);
 
-        return visualRow !== null && visualRow >= 0;
-      });
-      const visibleColumn = entry.cols.find((physicalColumn) => {
-        const visualColumn = columnMapper.getVisualFromPhysicalIndex(physicalColumn);
+      return visualColumn !== null && visualColumn >= 0;
+    };
 
-        return visualColumn !== null && visualColumn >= 0;
-      });
+    let snapshot = this.#filterPhysicalSnapshot;
 
-      const drop = visibleRow !== undefined && visibleColumn !== undefined &&
-        physicalRows.has(visibleRow) && physicalColumns.has(visibleColumn);
+    this.#unmergedClips.forEach((clip) => {
+      const cornerRow = this.hot.toPhysicalRow(clip.row);
+      const cornerColumn = this.hot.toPhysicalColumn(clip.col);
 
-      // Inside a `mergeSelection`, hand the dropped entry to the upcoming re-merge so it can fold
-      // the original (possibly filter-hidden) rows/columns back in.
-      if (drop && this.#remergeSnapshotReclaim !== null) {
-        this.#remergeSnapshotReclaim.push(entry);
+      if (cornerRow === null || cornerColumn === null) {
+        return;
       }
 
-      return !drop;
+      // The clip's full visual span maps entirely to visible rows/columns; collect them as the
+      // physical cells this clip occupied, to remove from its owning entry.
+      const clipRows = new Set<number>();
+      const clipColumns = new Set<number>();
+
+      for (let r = clip.row; r < clip.row + clip.rowspan; r++) {
+        const physicalRow = this.hot.toPhysicalRow(r);
+
+        if (physicalRow !== null) {
+          clipRows.add(physicalRow);
+        }
+      }
+      for (let c = clip.col; c < clip.col + clip.colspan; c++) {
+        const physicalColumn = this.hot.toPhysicalColumn(c);
+
+        if (physicalColumn !== null) {
+          clipColumns.add(physicalColumn);
+        }
+      }
+
+      snapshot = snapshot.filter((entry) => {
+        // Only the entry whose rectangle contains the clip's corner owns it (mirrors the live
+        // removal, which drops merges by top-left corner). Other entries pass through untouched.
+        if (!entry.rows.includes(cornerRow) || !entry.cols.includes(cornerColumn)) {
+          return true;
+        }
+
+        const keptRows = entry.rows.filter(row => !clipRows.has(row));
+        const keptCols = entry.cols.filter(col => !clipColumns.has(col));
+        const hasOtherVisibleRows = keptRows.some(isVisibleRow);
+        const hasOtherVisibleColumns = keptCols.some(isVisibleColumn);
+
+        // The clip was the entry's only visible part: drop it whole (filter-hidden lines included),
+        // handing it to a pending `mergeSelection` re-merge so those lines can be folded back.
+        if (!hasOtherVisibleRows && !hasOtherVisibleColumns) {
+          if (this.#remergeSnapshotReclaim !== null) {
+            this.#remergeSnapshotReclaim.push(entry);
+          }
+
+          return false;
+        }
+
+        // Sibling clips remain: carve just this clip out of the shared entry along the axis that
+        // still has other visible lines (filtering splits by rows; it never hides columns).
+        if (hasOtherVisibleRows) {
+          entry.rows = keptRows;
+        } else {
+          entry.cols = keptCols;
+        }
+
+        return true;
+      });
     });
+
+    this.#filterPhysicalSnapshot = snapshot;
   };
 
   /**
@@ -1877,6 +1942,12 @@ export class MergeCells extends BasePlugin {
    * @param {Array<{ rows: number[], cols: number[] }>} snapshot Physical snapshot of merges.
    */
   #rebuildMergesFromPhysical(snapshot: { rows: number[], cols: number[] }[]) {
+    // Nothing to restore and nothing live to clear: the empty snapshot a merge-less filtered grid
+    // captures must not pay for a clear + rebuild on every `filter()` call.
+    if (snapshot.length === 0 && this.mergedCellsCollection.mergedCells.length === 0) {
+      return;
+    }
+
     const { rowIndexMapper: rowMapper, columnIndexMapper: columnMapper } = this.hot;
 
     // Suppress snapshot-sync callbacks: the `mergeRange` calls below are internal and must not

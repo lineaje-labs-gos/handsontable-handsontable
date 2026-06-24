@@ -2679,5 +2679,152 @@ describe('MergeCells', () => {
       expect(mergeCells.mergedCellsCollection.get(4, 2)).toBe(false);
       expect(getCell(4, 2).getAttribute('rowspan')).toBe(null);
     });
+
+    it('should drop only the targeted entries when one unmerge removes several merges while filtered', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 5),
+        filters: true,
+        mergeCells: [
+          { row: 1, col: 0, rowspan: 2, colspan: 2 }, // A2:B3, physical rows 1, 2
+          { row: 5, col: 0, rowspan: 2, colspan: 2 }, // A6:B7, physical rows 5, 6
+          { row: 8, col: 3, rowspan: 2, colspan: 2 } // D9:E10, physical rows 8, 9 (control)
+        ],
+      });
+      const filters = getPlugin('filters');
+      const mergeCells = getPlugin('mergeCells');
+
+      // activate the snapshot without clipping any merge (hide an unrelated row, E5 / physical row 4)
+      filters.addCondition(4, 'by_value', [['E1', 'E2', 'E3', 'E4', 'E6', 'E7', 'E8', 'E9', 'E10']]);
+      filters.filter();
+
+      await render();
+
+      // one unmergeRange removes the first two merges (their corners sit in the range); the per-clip
+      // sync must drop exactly those two entries and leave the third (corner outside) untouched.
+      mergeCells.unmergeSelection(hot()._createCellRange(
+        hot()._createCellCoords(1, 0),
+        hot()._createCellCoords(1, 0),
+        hot()._createCellCoords(5, 1)
+      ));
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      const collection = mergeCells.mergedCellsCollection;
+
+      // the two unmerged merges stay gone after the rebuild, the control merge survives
+      expect(collection.get(1, 0)).toBe(false);
+      expect(collection.get(5, 0)).toBe(false);
+      expect(collection.get(8, 3).rowspan).toBe(2);
+      expect(collection.get(8, 3).colspan).toBe(2);
+    });
+
+    it('should grow the snapshot merge (not split it) when a row is inserted inside it while filtered', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(10, 4),
+        filters: true,
+        mergeCells: [
+          { row: 2, col: 0, rowspan: 4, colspan: 2 } // A3:B6, physical rows 2, 3, 4, 5
+        ],
+      });
+      const filters = getPlugin('filters');
+      const mergeCells = getPlugin('mergeCells');
+
+      // activate the snapshot without clipping the merge (hide D8 / physical row 7, below it)
+      filters.addCondition(3, 'by_value', [['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7', 'D9', 'D10']]);
+      filters.filter();
+
+      await render();
+
+      // insert a row inside the merge: the live merge grows (rowspan 4 → 5), so the snapshot entry
+      // must absorb the new physical row too instead of keeping a hole that splits it on rebuild.
+      await alter('insert_row_above', 4, 1);
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      // the merge comes back as one block covering the inserted row, not two clips
+      expect(mergeCells.mergedCellsCollection.mergedCells.length).toBe(1);
+      expect(getCell(2, 0).getAttribute('rowspan')).toBe('5');
+      expect(getCell(2, 0).getAttribute('colspan')).toBe('2');
+    });
+
+    it('should keep the snapshot valid across a row move while filtered', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(8, 4),
+        filters: true,
+        manualRowMove: true,
+        mergeCells: [
+          { row: 2, col: 0, rowspan: 3, colspan: 2 } // A3:B5, physical rows 2, 3, 4
+        ],
+      });
+      const filters = getPlugin('filters');
+
+      // activate the snapshot without clipping the merge (hide D8 / physical row 7, the last one)
+      filters.addCondition(3, 'by_value', [['D1', 'D2', 'D3', 'D4', 'D5', 'D6', 'D7']]);
+      filters.filter();
+
+      await render();
+
+      // a move only permutes the visual order; physical indexes are stable, so the physical snapshot
+      // stays valid without any sync. This move reorders a non-merge row without bisecting the merge.
+      getPlugin('manualRowMove').moveRow(0, 5);
+
+      await render();
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      const merges = getPlugin('mergeCells').mergedCellsCollection.mergedCells;
+
+      // after clearing, the merge is rebuilt intact (one 3-row block), not lost or corrupted
+      expect(merges.length).toBe(1);
+      expect(merges[0].rowspan).toBe(3);
+      expect(merges[0].colspan).toBe(2);
+    });
+
+    it('should track a merge created during a filter that started with no merges', async() => {
+      handsontable({
+        data: Handsontable.helper.createSpreadsheetData(8, 4),
+        filters: true,
+        mergeCells: true, // plugin enabled, but no merges declared
+      });
+      const filters = getPlugin('filters');
+      const mergeCells = getPlugin('mergeCells');
+
+      // first filter runs with no merges (hide D4 / physical row 3); the snapshot must still be
+      // established so the merge created next is tracked, not captured already-clipped later.
+      filters.addCondition(3, 'by_value', [['D1', 'D2', 'D3', 'D5', 'D6', 'D7', 'D8']]);
+      filters.filter();
+
+      await render();
+
+      // merge across the hidden row 3: visual rows 2 and 3 map to physical 2 and 4
+      await selectCell(2, 0, 3, 1);
+      mergeCells.mergeSelection();
+
+      // re-filter while still clipped — a non-contiguous capture here would split the merge on clear
+      filters.filter();
+
+      await render();
+
+      filters.clearConditions();
+      filters.filter();
+
+      await render();
+
+      const merges = mergeCells.mergedCellsCollection.mergedCells;
+
+      // the merge survives as one contiguous block spanning the formerly-hidden row, not two clips
+      expect(merges.length).toBe(1);
+      expect(getCell(2, 0).getAttribute('rowspan')).toBe('3');
+      expect(getCell(2, 0).getAttribute('colspan')).toBe('2');
+    });
   });
 });
