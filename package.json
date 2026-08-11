@@ -79,7 +79,7 @@
     "@types/pikaday": "1.7.4",
     "core-js": "^3.0.0",
     "dompurify": "^2.1.1",
-    "moment": "2.24.0",
+    "moment": ">=2.30.1",
     "numbro": "2.1.2",
     "pikaday": "1.8.0"
   },
@@ -154,7 +154,8 @@
   },
   "license": "SEE LICENSE IN LICENSE.txt",
   "resolutions": {
-    "babel-core": "7.0.0-bridge.0"
+    "babel-core": "7.0.0-bridge.0",
+    "moment": ">=2.30.1"
   },
   "typings": "./index.d.ts",
   "handsontable": {
@@ -244,5 +245,8 @@
   "sideEffects": [
     "**/*.css",
     "./languages/*"
-  ]
+  ],
+  "overrides": {
+    "moment": ">=2.30.1"
+  }
 }
